@@ -1,6 +1,7 @@
 module vldap
 
 import net
+import net.ssl
 import time
 
 pub struct ClientConfig {
@@ -24,8 +25,10 @@ pub:
 
 pub struct Client {
 mut:
-	conn       &net.TcpConn = unsafe { nil }
-	message_id int          = 1
+	tcp        &net.TcpConn = unsafe { nil }
+	tls        &ssl.SSLConn = unsafe { nil }
+	use_ssl    bool
+	message_id int = 1
 }
 
 pub fn authenticate_user(config ClientConfig, request UserAuthRequest) !LdapEntry {
@@ -44,15 +47,23 @@ pub fn authenticate_user(config ClientConfig, request UserAuthRequest) !LdapEntr
 
 pub fn connect(config ClientConfig) !Client {
 	clean := validate_client_config(config)!
+	timeout := timeout_duration(clean)
 	if clean.use_ssl {
-		return error('LDAPS is not supported by this pure V transport yet')
+		mut tls := ssl.new_ssl_conn(ssl.SSLConnectConfig{
+			validate: false
+		})!
+		tls.set_read_timeout(timeout)
+		tls.dial(clean.host, clean.port)!
+		return Client{
+			tls:     tls
+			use_ssl: true
+		}
 	}
 	mut conn := net.dial_tcp('${clean.host}:${clean.port}')!
-	timeout := timeout_duration(clean)
 	conn.set_read_timeout(timeout)
 	conn.set_write_timeout(timeout)
 	return Client{
-		conn: conn
+		tcp: conn
 	}
 }
 
@@ -87,8 +98,14 @@ pub fn (mut client Client) search(base_dn string, filter string, attributes []st
 }
 
 pub fn (mut client Client) close() ! {
-	if !isnil(client.conn) {
-		client.conn.close()!
+	if client.use_ssl {
+		if !isnil(client.tls) {
+			client.tls.shutdown()!
+		}
+		return
+	}
+	if !isnil(client.tcp) {
+		client.tcp.close()!
 	}
 }
 
@@ -99,7 +116,11 @@ fn (mut client Client) next_message_id() int {
 }
 
 fn (mut client Client) write_packet(packet []u8) ! {
-	written := client.conn.write(packet)!
+	written := if client.use_ssl {
+		client.tls.write(packet)!
+	} else {
+		client.tcp.write(packet)!
+	}
 	if written != packet.len {
 		return error('short LDAP write')
 	}
@@ -107,7 +128,7 @@ fn (mut client Client) write_packet(packet []u8) ! {
 
 fn (mut client Client) read_packet() !BerValue {
 	mut header := []u8{len: 2}
-	read_exact(mut client.conn, mut header)!
+	client.read_exact(mut header)!
 	mut length_cursor := BerCursor{
 		pos: 1
 	}
@@ -117,7 +138,7 @@ fn (mut client Client) read_packet() !BerValue {
 		}
 		count := int(header[1] & 0x7f)
 		mut extra := []u8{len: count}
-		read_exact(mut client.conn, mut extra)!
+		client.read_exact(mut extra)!
 		mut len_bytes := [header[1]]
 		len_bytes << extra
 		mut cursor := BerCursor{}
@@ -127,15 +148,19 @@ fn (mut client Client) read_packet() !BerValue {
 	packet << header[0]
 	packet << ber_length(length)
 	mut content := []u8{len: length}
-	read_exact(mut client.conn, mut content)!
+	client.read_exact(mut content)!
 	packet << content
 	return decode_ber(packet)
 }
 
-fn read_exact(mut conn net.TcpConn, mut buffer []u8) ! {
+fn (mut client Client) read_exact(mut buffer []u8) ! {
 	mut offset := 0
 	for offset < buffer.len {
-		read_count := conn.read(mut buffer[offset..])!
+		read_count := if client.use_ssl {
+			client.tls.read(mut buffer[offset..])!
+		} else {
+			client.tcp.read(mut buffer[offset..])!
+		}
 		if read_count <= 0 {
 			return error('LDAP connection closed')
 		}
